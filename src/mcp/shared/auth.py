@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import AnyHttpUrl, AnyUrl, BaseModel, Field, field_validator
+from pydantic import AnyHttpUrl, AnyUrl, BaseModel, Field, field_validator, model_validator
 
 
 class OAuthToken(BaseModel):
@@ -22,6 +22,32 @@ class OAuthToken(BaseModel):
             # https://datatracker.ietf.org/doc/html/rfc6750#section-4
             return v.title()
         return v  # pragma: no cover
+
+
+class AuthCredentials(BaseModel):
+    """通用凭证基类"""
+
+    protocol_id: str
+    expires_at: int | None = None
+
+
+class OAuthCredentials(AuthCredentials):
+    """OAuth凭证（包装现有OAuthToken）"""
+
+    protocol_id: str = "oauth2"
+    access_token: str
+    token_type: Literal["Bearer"] = "Bearer"
+    refresh_token: str | None = None
+    scope: str | None = None
+    cnf: dict[str, Any] | None = None  # DPoP绑定信息
+
+
+class APIKeyCredentials(AuthCredentials):
+    """API Key凭证"""
+
+    protocol_id: str = "api_key"
+    api_key: str
+    key_id: str | None = None
 
 
 class InvalidScopeError(Exception):
@@ -135,6 +161,24 @@ class OAuthMetadata(BaseModel):
     client_id_metadata_document_supported: bool | None = None
 
 
+class AuthProtocolMetadata(BaseModel):
+    """单个授权协议的元数据（MCP扩展）"""
+
+    protocol_id: str = Field(..., pattern=r"^[a-z0-9_]+$")
+    protocol_version: str
+    metadata_url: AnyHttpUrl | None = None
+    endpoints: dict[str, AnyHttpUrl] = Field(default_factory=dict)
+    capabilities: list[str] = Field(default_factory=list)
+    # OAuth特定字段（可选）
+    client_auth_methods: list[str] | None = None
+    grant_types: list[str] | None = None
+    scopes_supported: list[str] | None = None
+    # DPoP支持（协议无关）
+    dpop_signing_alg_values_supported: list[str] | None = None
+    dpop_bound_credentials_required: bool | None = None
+    additional_params: dict[str, Any] = Field(default_factory=dict)
+
+
 class ProtectedResourceMetadata(BaseModel):
     """
     RFC 9728 OAuth 2.0 Protected Resource Metadata.
@@ -157,3 +201,27 @@ class ProtectedResourceMetadata(BaseModel):
     dpop_signing_alg_values_supported: list[str] | None = None
     # dpop_bound_access_tokens_required default is False, but ommited here for clarity
     dpop_bound_access_tokens_required: bool | None = None
+    # MCP扩展字段（多协议支持）
+    mcp_auth_protocols: list["AuthProtocolMetadata"] | None = None
+    mcp_default_auth_protocol: str | None = None
+    mcp_auth_protocol_preferences: dict[str, int] | None = None
+
+    @model_validator(mode="after")
+    def _ensure_backward_compatibility(self) -> "ProtectedResourceMetadata":
+        """向后兼容：如果mcp_auth_protocols为空且存在authorization_servers，自动创建OAuth 2.0协议元数据"""
+        if self.mcp_auth_protocols is None and self.authorization_servers:
+            endpoints: dict[str, AnyHttpUrl] = {}
+            for idx, server in enumerate(self.authorization_servers):
+                endpoints[f"authorization_server_{idx}"] = server
+
+            self.mcp_auth_protocols = [
+                AuthProtocolMetadata(
+                    protocol_id="oauth2",
+                    protocol_version="2.0",
+                    metadata_url=self.authorization_servers[0] if len(self.authorization_servers) == 1 else None,
+                    endpoints=endpoints,
+                )
+            ]
+            if self.mcp_default_auth_protocol is None:
+                self.mcp_default_auth_protocol = "oauth2"
+        return self
