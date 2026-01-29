@@ -50,6 +50,7 @@ class _MockProtocol:
         self,
         metadata_url: str | None = None,
         prm: ProtectedResourceMetadata | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> AuthProtocolMetadata | None:
         return None
 

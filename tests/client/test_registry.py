@@ -27,6 +27,7 @@ class _MockAuthProtocol:
         self,
         metadata_url: str | None = None,
         prm: ProtectedResourceMetadata | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> AuthProtocolMetadata | None:
         return None
 
@@ -48,6 +49,7 @@ class _MockOAuth2Protocol:
         self,
         metadata_url: str | None = None,
         prm: ProtectedResourceMetadata | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> AuthProtocolMetadata | None:
         return None
 
@@ -69,6 +71,7 @@ class _MockApiKeyProtocol:
         self,
         metadata_url: str | None = None,
         prm: ProtectedResourceMetadata | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> AuthProtocolMetadata | None:
         return None
 
