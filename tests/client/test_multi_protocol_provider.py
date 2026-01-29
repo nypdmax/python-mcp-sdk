@@ -5,6 +5,7 @@ import pytest
 
 from mcp.client.auth.multi_protocol import (
     MultiProtocolAuthProvider,
+    OAuthTokenStorageAdapter,
     TokenStorage,
     _credentials_to_storage,
     _oauth_token_to_credentials,
@@ -197,3 +198,85 @@ def test_prepare_request_no_op_when_protocol_missing(
     creds = AuthCredentials(protocol_id="other")
     provider._prepare_request(request, creds)
     assert _MockProtocol._prepare_called is False
+
+
+class _OAuthTokenOnlyMockStorage:
+    """Minimal storage that only supports OAuthToken (dual contract: oauth2 side)."""
+
+    def __init__(self) -> None:
+        self._tokens: OAuthToken | None = None
+
+    async def get_tokens(self) -> OAuthToken | None:
+        return self._tokens
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        self._tokens = tokens
+
+
+@pytest.mark.anyio
+async def test_oauth_token_storage_adapter_get_tokens_returns_credentials_when_wrapped_has_token() -> None:
+    """OAuthTokenStorageAdapter.get_tokens converts OAuthToken to OAuthCredentials."""
+    raw = OAuthToken(
+        access_token="at",
+        token_type="Bearer",
+        expires_in=3600,
+        scope="read",
+        refresh_token="rt",
+    )
+    wrapped = _OAuthTokenOnlyMockStorage()
+    wrapped._tokens = raw
+    adapter = OAuthTokenStorageAdapter(wrapped)
+
+    result = await adapter.get_tokens()
+
+    assert result is not None
+    assert isinstance(result, OAuthCredentials)
+    assert result.protocol_id == "oauth2"
+    assert result.access_token == "at"
+    assert result.refresh_token == "rt"
+
+
+@pytest.mark.anyio
+async def test_oauth_token_storage_adapter_set_tokens_stores_oauth_token_when_given_credentials() -> None:
+    """OAuthTokenStorageAdapter.set_tokens converts OAuthCredentials to OAuthToken and stores."""
+    wrapped = _OAuthTokenOnlyMockStorage()
+    adapter = OAuthTokenStorageAdapter(wrapped)
+    creds = OAuthCredentials(
+        protocol_id="oauth2",
+        access_token="at",
+        token_type="Bearer",
+        refresh_token="rt",
+        scope="read",
+        expires_at=None,
+    )
+
+    await adapter.set_tokens(creds)
+
+    assert wrapped._tokens is not None
+    assert wrapped._tokens.access_token == "at"
+    assert wrapped._tokens.refresh_token == "rt"
+
+
+@pytest.mark.anyio
+async def test_get_credentials_returns_oauth_credentials_when_storage_returns_oauth_token() -> None:
+    """MultiProtocolAuthProvider._get_credentials converts OAuthToken from storage to OAuthCredentials (dual contract)."""
+    raw = OAuthToken(
+        access_token="stored_at",
+        token_type="Bearer",
+        expires_in=3600,
+        scope="read",
+    )
+    storage = _MockStorage()
+    storage._tokens = raw
+    provider = MultiProtocolAuthProvider(
+        server_url="https://example.com",
+        storage=storage,
+        protocols=[],
+    )
+    provider._initialize()
+
+    result = await provider._get_credentials()
+
+    assert result is not None
+    assert isinstance(result, OAuthCredentials)
+    assert result.access_token == "stored_at"
