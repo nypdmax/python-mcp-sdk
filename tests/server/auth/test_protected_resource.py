@@ -9,6 +9,7 @@ from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
 
 from mcp.server.auth.routes import build_resource_metadata_url, create_protected_resource_routes
+from mcp.shared.auth import AuthProtocolMetadata
 
 
 @pytest.fixture
@@ -49,6 +50,17 @@ async def test_metadata_endpoint_with_path(test_client: httpx.AsyncClient):
             "resource_name": "Example Resource",
             "resource_documentation": "https://docs.example.com/resource",
             "bearer_methods_supported": ["header"],
+            "mcp_auth_protocols": [
+                {
+                    "protocol_id": "oauth2",
+                    "protocol_version": "2.0",
+                    "metadata_url": "https://auth.example.com/authorization",
+                    "endpoints": {"authorization_server_0": "https://auth.example.com/authorization"},
+                    "capabilities": [],
+                    "additional_params": {},
+                }
+            ],
+            "mcp_default_auth_protocol": "oauth2",
         }
     )
 
@@ -101,6 +113,17 @@ async def test_metadata_endpoint_without_path(root_resource_client: httpx.AsyncC
             "scopes_supported": ["read"],
             "resource_name": "Root Resource",
             "bearer_methods_supported": ["header"],
+            "mcp_auth_protocols": [
+                {
+                    "protocol_id": "oauth2",
+                    "protocol_version": "2.0",
+                    "metadata_url": "https://auth.example.com/",
+                    "endpoints": {"authorization_server_0": "https://auth.example.com/"},
+                    "capabilities": [],
+                    "additional_params": {},
+                }
+            ],
+            "mcp_default_auth_protocol": "oauth2",
         }
     )
 
@@ -140,6 +163,56 @@ class TestMetadataUrlConstruction:
         """Test URL construction with various resource configurations."""
         result = build_resource_metadata_url(AnyHttpUrl(resource_url))
         assert str(result) == expected_url
+
+
+@pytest.fixture
+def multiprotocol_app() -> Starlette:
+    """Fixture for protected resource with mcp_* extension (auth_protocols, default_protocol, protocol_preferences)."""
+    routes = create_protected_resource_routes(
+        resource_url=AnyHttpUrl("https://example.com/mcp"),
+        authorization_servers=[AnyHttpUrl("https://auth.example.com")],
+        scopes_supported=["read"],
+        auth_protocols=[
+            AuthProtocolMetadata(protocol_id="oauth2", protocol_version="2.0"),
+            AuthProtocolMetadata(protocol_id="api_key", protocol_version="1"),
+        ],
+        default_protocol="oauth2",
+        protocol_preferences={"oauth2": 1, "api_key": 2},
+    )
+    return Starlette(routes=routes)
+
+
+@pytest.fixture
+async def multiprotocol_client(multiprotocol_app: Starlette):
+    """HTTP client for multiprotocol protected resource app."""
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=multiprotocol_app), base_url="https://mcptest.com"
+    ) as client:
+        yield client
+
+
+@pytest.mark.anyio
+async def test_metadata_includes_mcp_auth_protocols(multiprotocol_client: httpx.AsyncClient) -> None:
+    """PRM endpoint returns mcp_auth_protocols, mcp_default_auth_protocol, mcp_auth_protocol_preferences when provided."""
+    response = await multiprotocol_client.get("/.well-known/oauth-protected-resource/mcp")
+    assert response.status_code == 200
+    data = response.json()
+    assert "mcp_auth_protocols" in data
+    assert len(data["mcp_auth_protocols"]) == 2
+    assert data["mcp_auth_protocols"][0]["protocol_id"] == "oauth2"
+    assert data["mcp_auth_protocols"][1]["protocol_id"] == "api_key"
+    assert data.get("mcp_default_auth_protocol") == "oauth2"
+    assert data.get("mcp_auth_protocol_preferences") == {"oauth2": 1, "api_key": 2}
+
+
+@pytest.mark.anyio
+async def test_metadata_without_mcp_params_unchanged(root_resource_client: httpx.AsyncClient) -> None:
+    """When auth_protocols/default_protocol/protocol_preferences not passed, backward compat fills mcp_* from authorization_servers."""
+    response = await root_resource_client.get("/.well-known/oauth-protected-resource")
+    assert response.status_code == 200
+    data = response.json()
+    assert "mcp_auth_protocols" in data
+    assert data.get("mcp_default_auth_protocol") == "oauth2"
 
 
 class TestRouteConsistency:
