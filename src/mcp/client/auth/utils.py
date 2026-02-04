@@ -22,6 +22,16 @@ from mcp.types import LATEST_PROTOCOL_VERSION
 logger = logging.getLogger(__name__)
 
 
+def format_json_for_logging(raw: str | bytes) -> str:
+    """Format JSON for readable logging; returns raw string if not valid JSON."""
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    try:
+        obj = json.loads(text)
+        return json.dumps(obj, indent=2, ensure_ascii=False)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return text
+
+
 def extract_field_from_www_auth(response: Response, field_name: str, auth_scheme: str | None = None) -> str | None:
     """
     Extract field from WWW-Authenticate header.
@@ -44,7 +54,7 @@ def extract_field_from_www_auth(response: Response, field_name: str, auth_scheme
     # If auth_scheme is specified, extract only from that scheme's parameters
     if auth_scheme:
         # Pattern to match the specified auth scheme and its parameters
-        scheme_pattern = rf'{re.escape(auth_scheme)}\s+([^,]+(?:,\s*[^,]+)*)'
+        scheme_pattern = rf"{re.escape(auth_scheme)}\s+([^,]+(?:,\s*[^,]+)*)"
         scheme_match = re.search(scheme_pattern, www_auth_header, re.IGNORECASE)
         if not scheme_match:
             return None
@@ -145,40 +155,96 @@ async def discover_authorization_servers(
     """
     Discover supported auth protocols (unified discovery with PRM fallback).
 
-    1. Tries the unified capability discovery endpoint
-       `/.well-known/authorization_servers` (path relative to resource_url).
-    2. If that fails or returns no protocols, falls back to protocol list from
-       PRM when provided (e.g. from a prior 401 with resource_metadata).
+    Discovery priority:
+    1. PRM mcp_auth_protocols (if present)
+    2. Path-relative unified discovery: {origin}/.well-known/authorization_servers{resource_path}
+    3. Root-based unified discovery: {origin}/.well-known/authorization_servers
 
     Args:
         resource_url: Base URL of the resource (e.g. MCP server URL).
         http_client: HTTP client for the request.
-        prm: Optional PRM; used as fallback when unified discovery fails.
+        prm: Optional PRM; if contains mcp_auth_protocols, used as first priority.
 
     Returns:
-        List of protocol metadata; empty if discovery fails and no PRM fallback.
+        List of protocol metadata; empty if discovery fails (caller should handle OAuth fallback).
     """
-    # 1. Unified discovery endpoint (path-relative to resource_url)
-    discovery_url = urljoin(resource_url.rstrip("/") + "/", ".well-known/authorization_servers")
-    try:
-        response = await http_client.get(discovery_url)
-        if response.status_code == 200:
-            content = await response.aread()
-            data = json.loads(content)
-            raw = data.get("protocols")
-            protocols_data: list[dict[str, Any]] = cast(list[dict[str, Any]], raw) if isinstance(raw, list) else []
-            if protocols_data:
-                return [AuthProtocolMetadata.model_validate(p) for p in protocols_data]
-    except (ValidationError, ValueError, KeyError, TypeError) as e:
-        logger.debug("Unified authorization_servers discovery failed: %s", e)
-    except Exception as e:
-        logger.debug("Unified authorization_servers request failed: %s", e)
-
-    # 2. Fallback: use protocol list from PRM
-    if prm is not None and prm.mcp_auth_protocols:
+    # Priority 1: PRM中的协议信息
+    if prm and prm.mcp_auth_protocols:
+        protocol_ids = [m.protocol_id for m in prm.mcp_auth_protocols]
+        auth_servers = [str(u) for u in (prm.authorization_servers or [])]
+        logger.debug(
+            "[Auth discovery] Using PRM mcp_auth_protocols (priority 1): protocol_ids=%s, authorization_servers=%s",
+            protocol_ids,
+            auth_servers,
+        )
         return list(prm.mcp_auth_protocols)
 
+    # Priority 2 & 3: 统一发现端点
+    discovery_urls = build_authorization_servers_discovery_urls(resource_url)
+    for discovery_url in discovery_urls:
+        try:
+            logger.debug("[Auth discovery] Trying unified discovery endpoint: %s", discovery_url)
+            response = await http_client.get(discovery_url)
+            if response.status_code == 200:
+                content = await response.aread()
+                logger.debug(
+                    "[Auth discovery] Unified discovery endpoint: %s, status_code: 200\n%s",
+                    discovery_url,
+                    format_json_for_logging(content),
+                )
+                data = json.loads(content)
+                raw = data.get("protocols")
+                protocols_data: list[dict[str, Any]] = cast(list[dict[str, Any]], raw) if isinstance(raw, list) else []
+                if protocols_data:
+                    return [AuthProtocolMetadata.model_validate(p) for p in protocols_data]
+            else:
+                logger.debug(
+                    "[Auth discovery] Unified discovery endpoint: %s, status_code: %s (no protocol list)",
+                    discovery_url,
+                    response.status_code,
+                )
+        except (ValidationError, ValueError, KeyError, TypeError) as e:
+            logger.debug("Unified discovery parse failed at %s: %s", discovery_url, e)
+        except Exception as e:
+            logger.debug("Unified discovery request failed at %s: %s", discovery_url, e)
+
+    # 如果都失败，返回空列表（由调用方处理OAuth回退）
+    logger.debug("All unified discovery endpoints failed")
     return []
+
+
+def build_authorization_servers_discovery_urls(resource_url: str) -> list[str]:
+    """
+    Build ordered list of URLs to try for unified authorization servers discovery.
+
+    Per MCP multiprotocol spec, the client should try:
+    1. Path-relative discovery: {origin}/.well-known/authorization_servers{resource_path}
+    2. Root-based discovery: {origin}/.well-known/authorization_servers
+
+    Many resource servers mount the discovery endpoint at origin root.
+
+    Args:
+        resource_url: Base URL of the resource (e.g. MCP server URL like http://localhost:8002/mcp)
+
+    Returns:
+        Ordered list of URLs to try for unified discovery
+    """
+    urls: list[str] = []
+    parsed = urlparse(resource_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Priority 1: Path-relative discovery (方式B: 将resource_path附加到/.well-known/authorization_servers后面)
+    # Example: http://localhost:8002/.well-known/authorization_servers/mcp
+    if parsed.path and parsed.path != "/":
+        path_relative_url = f"{base_url}/.well-known/authorization_servers{parsed.path}"
+        urls.append(path_relative_url)
+
+    # Priority 2: Root-based discovery
+    # Example: http://localhost:8002/.well-known/authorization_servers
+    root_based_url = f"{base_url}/.well-known/authorization_servers"
+    urls.append(root_based_url)
+
+    return urls
 
 
 def build_protected_resource_metadata_discovery_urls(www_auth_url: str | None, server_url: str) -> list[str]:
@@ -298,9 +364,17 @@ async def handle_protected_resource_response(
     Returns:
         True if metadata was successfully discovered, False if we should try next URL
     """
+    url = getattr(response, "url", None) or getattr(getattr(response, "request", None), "url", "")
     if response.status_code == 200:
         try:
             content = await response.aread()
+            text = content.decode("utf-8", errors="replace")
+            logger.debug(
+                "[Auth discovery] PRM endpoint: %s, status_code: %s\n%s",
+                url,
+                response.status_code,
+                format_json_for_logging(text),
+            )
             metadata = ProtectedResourceMetadata.model_validate_json(content)
             return metadata
 
@@ -308,7 +382,11 @@ async def handle_protected_resource_response(
             # Invalid metadata - try next URL
             return None
     else:
-        # Not found - try next URL in fallback chain
+        logger.debug(
+            "[Auth discovery] PRM endpoint: %s, status_code: %s (no metadata)",
+            url,
+            response.status_code,
+        )
         return None
 
 

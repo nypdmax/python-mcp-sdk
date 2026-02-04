@@ -24,17 +24,18 @@ import math
 import time
 from collections.abc import AsyncGenerator
 from typing import Any, Protocol, cast
-from urllib.parse import urljoin
 
 import anyio
 import httpx
 from pydantic import ValidationError
 
 from mcp.client.auth._oauth_401_flow import oauth_401_flow_generator
-from mcp.client.auth.oauth2 import OAuthClientProvider, TokenStorage as OAuth2TokenStorage
+from mcp.client.auth.oauth2 import OAuthClientProvider
+from mcp.client.auth.oauth2 import TokenStorage as OAuth2TokenStorage
 from mcp.client.auth.protocol import AuthContext, AuthProtocol, DPoPEnabledProtocol
-from mcp.client.streamable_http import MCP_PROTOCOL_VERSION
 from mcp.client.auth.utils import (
+    format_json_for_logging,
+    build_authorization_servers_discovery_urls,
     build_protected_resource_metadata_discovery_urls,
     create_oauth_metadata_request,
     extract_auth_protocols_from_www_auth,
@@ -45,6 +46,7 @@ from mcp.client.auth.utils import (
     extract_scope_from_www_auth,
     handle_protected_resource_response,
 )
+from mcp.client.streamable_http import MCP_PROTOCOL_VERSION
 from mcp.shared.auth import (
     AuthCredentials,
     AuthProtocolMetadata,
@@ -119,11 +121,9 @@ def _credentials_to_storage(credentials: AuthCredentials) -> AuthCredentials | O
 class _OAuthTokenOnlyStorage(Protocol):
     """仅支持 OAuthToken 的存储契约（供 OAuthTokenStorageAdapter 包装）。"""
 
-    async def get_tokens(self) -> OAuthToken | None:
-        ...
+    async def get_tokens(self) -> OAuthToken | None: ...
 
-    async def set_tokens(self, tokens: OAuthToken) -> None:
-        ...
+    async def set_tokens(self, tokens: OAuthToken) -> None: ...
 
 
 class OAuthTokenStorageAdapter:
@@ -145,11 +145,7 @@ class OAuthTokenStorageAdapter:
         return _oauth_token_to_credentials(raw)
 
     async def set_tokens(self, tokens: AuthCredentials | OAuthToken) -> None:
-        to_store = (
-            _credentials_to_storage(tokens)
-            if isinstance(tokens, AuthCredentials)
-            else tokens
-        )
+        to_store = _credentials_to_storage(tokens) if isinstance(tokens, AuthCredentials) else tokens
         if isinstance(to_store, OAuthToken):
             await self._wrapped.set_tokens(to_store)
 
@@ -251,33 +247,40 @@ class MultiProtocolAuthProvider(httpx.Auth):
     async def _parse_protocols_from_discovery_response(
         self, response: httpx.Response, prm: ProtectedResourceMetadata | None
     ) -> list[AuthProtocolMetadata]:
-        """解析 .well-known/authorization_servers 响应，回退到 PRM。"""
+        """解析 .well-known/authorization_servers 响应。"""
+        url = getattr(response, "url", None) or getattr(getattr(response, "request", None), "url", "")
         if response.status_code == 200:
             try:
                 content = await response.aread()
-                data = json.loads(content.decode())
-                raw = data.get("protocols")
-                protocols_data: list[dict[str, Any]] = (
-                    cast(list[dict[str, Any]], raw) if isinstance(raw, list) else []
+                logger.debug(
+                    "[Auth discovery] Unified discovery endpoint: %s, status_code: 200\n%s",
+                    url,
+                    format_json_for_logging(content),
                 )
+                data = json.loads(content)
+                raw = data.get("protocols")
+                protocols_data: list[dict[str, Any]] = cast(list[dict[str, Any]], raw) if isinstance(raw, list) else []
                 if protocols_data:
                     return [AuthProtocolMetadata.model_validate(p) for p in protocols_data]
             except (ValidationError, ValueError, KeyError, TypeError) as e:
                 logger.debug("Unified authorization_servers parse failed: %s", e)
-        if prm is not None and prm.mcp_auth_protocols:
-            return list(prm.mcp_auth_protocols)
+        else:
+            logger.debug(
+                "[Auth discovery] Unified discovery endpoint: %s, status_code: %s (no protocol list)",
+                url,
+                response.status_code,
+            )
+        # 如果响应不是200或解析失败，返回空列表（不再回退到PRM，因为PRM已在调用方检查）
         return []
 
-    async def _handle_403_response(
-        self, response: httpx.Response, request: httpx.Request
-    ) -> None:
+    async def _handle_403_response(self, response: httpx.Response, request: httpx.Request) -> None:
         """处理 403：解析 error/scope 并记录，骨架不做重试。"""
         error = extract_field_from_www_auth(response, "error")
         scope = extract_field_from_www_auth(response, "scope")
         if error or scope:
             logger.debug("403 WWW-Authenticate: error=%s scope=%s", error, scope)
 
-    async def async_auth_flow(
+    async def async_auth_flow(  # noqa: C901, PLR0912, PLR0915
         self, request: httpx.Request
     ) -> AsyncGenerator[httpx.Request, httpx.Response]:
         """HTTPX 认证流程入口：取凭证、校验、准备请求、发送、处理 401/403 并可选重试。"""
@@ -309,34 +312,74 @@ class MultiProtocolAuthProvider(httpx.Auth):
 
                 # Step 1: PRM discovery (yield)
                 prm: ProtectedResourceMetadata | None = None
-                prm_urls = build_protected_resource_metadata_discovery_urls(
-                    resource_metadata_url, server_url
-                )
+                prm_urls = build_protected_resource_metadata_discovery_urls(resource_metadata_url, server_url)
                 for url in prm_urls:
+                    logger.debug("[Auth discovery] Trying PRM endpoint: %s", url)
                     prm_req = create_oauth_metadata_request(url)
                     prm_resp = yield prm_req
                     prm = await handle_protected_resource_response(prm_resp)
                     if prm is not None:
                         break
 
-                # Step 2: Protocol discovery (yield)
-                discovery_url = urljoin(
-                    server_url.rstrip("/") + "/",
-                    ".well-known/authorization_servers",
-                )
-                discovery_req = create_oauth_metadata_request(discovery_url)
-                discovery_resp = yield discovery_req
-                protocols_metadata = await self._parse_protocols_from_discovery_response(
-                    discovery_resp, prm
-                )
+                # Step 2: Protocol discovery
+                # 优先级1: 如果PRM包含mcp_auth_protocols，直接使用
+                protocols_metadata: list[AuthProtocolMetadata] = []
+                discovery_attempted_urls: list[str] = []
+                if prm and prm.mcp_auth_protocols:
+                    protocol_ids = [m.protocol_id for m in prm.mcp_auth_protocols]
+                    auth_servers = [str(u) for u in (prm.authorization_servers or [])]
+                    logger.debug(
+                        "[Auth discovery] Using PRM mcp_auth_protocols (priority 1): protocol_ids=%s, authorization_servers=%s",
+                        protocol_ids,
+                        auth_servers,
+                    )
+                    protocols_metadata = list(prm.mcp_auth_protocols)
+                else:
+                    # 优先级2 & 3: 尝试统一发现端点（path-relative，然后root-based）
+                    discovery_urls = build_authorization_servers_discovery_urls(server_url)
+                    for discovery_url in discovery_urls:
+                        discovery_attempted_urls.append(discovery_url)
+                        logger.debug("[Auth discovery] Trying unified discovery endpoint: %s", discovery_url)
+                        discovery_req = create_oauth_metadata_request(discovery_url)
+                        discovery_resp = yield discovery_req
+                        protocols_metadata = await self._parse_protocols_from_discovery_response(
+                            discovery_resp,
+                            None,  # 不在这里回退到PRM，因为已经在上面检查过了
+                        )
+                        if protocols_metadata:
+                            logger.debug("Unified discovery succeeded at %s", discovery_url)
+                            break
+
+                # Step 3: OAuth回退（如果统一发现失败且PRM存在）
+                if not protocols_metadata and prm and prm.authorization_servers:
+                    logger.debug("Unified discovery failed, falling back to OAuth protocol discovery")
+                    oauth_protocol = self._get_protocol("oauth2")
+                    if oauth_protocol and hasattr(oauth_protocol, "discover_metadata"):
+                        try:
+                            oauth_metadata = await oauth_protocol.discover_metadata(
+                                metadata_url=None,
+                                prm=prm,
+                                http_client=self._http_client,
+                            )
+                            if oauth_metadata:
+                                protocols_metadata = [oauth_metadata]
+                                logger.debug("OAuth protocol discovery succeeded")
+                        except Exception as e:
+                            logger.debug("OAuth protocol discovery failed: %s", e)
 
                 available = (
-                    [m.protocol_id for m in protocols_metadata]
-                    if protocols_metadata
-                    else (auth_protocols_header or [])
+                    [m.protocol_id for m in protocols_metadata] if protocols_metadata else (auth_protocols_header or [])
                 )
                 if not available:
-                    logger.debug("No available protocols from discovery or WWW-Authenticate")
+                    error_msg = (
+                        f"Failed to discover authentication protocols. "
+                        f"Tried URLs: {discovery_attempted_urls}. "
+                        f"PRM available: {prm is not None}, "
+                        f"PRM has authorization_servers: {bool(prm.authorization_servers if prm else False)}, "
+                        f"WWW-Authenticate protocols: {auth_protocols_header}"
+                    )
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
                 else:
                     # Select protocol candidates based on server hints, but only
                     # attempt protocols that are actually injected as instances.
@@ -357,9 +400,7 @@ class MultiProtocolAuthProvider(httpx.Auth):
                     if protocol_preferences:
                         for pid in sorted(
                             available,
-                            key=lambda p: protocol_preferences.get(
-                                p, UNSPECIFIED_PROTOCOL_PREFERENCE
-                            ),
+                            key=lambda p: protocol_preferences.get(p, UNSPECIFIED_PROTOCOL_PREFERENCE),
                         ):
                             _push(pid)
                     # Then remaining in server-provided order
@@ -369,9 +410,7 @@ class MultiProtocolAuthProvider(httpx.Auth):
                     for selected_id in candidates:
                         protocol = self._get_protocol(selected_id)
                         if protocol is None:
-                            logger.debug(
-                                "Protocol %s not injected as instance; skipping", selected_id
-                            )
+                            logger.debug("Protocol %s not injected as instance; skipping", selected_id)
                             continue
                         attempted_any = True
 
@@ -388,26 +427,14 @@ class MultiProtocolAuthProvider(httpx.Auth):
                                 oauth_protocol = protocol
                                 provider = OAuthClientProvider(
                                     server_url=server_url,
-                                    client_metadata=getattr(
-                                        oauth_protocol, "_client_metadata"
-                                    ),
+                                    client_metadata=getattr(oauth_protocol, "_client_metadata"),
                                     storage=cast(OAuth2TokenStorage, self.storage),
-                                    redirect_handler=getattr(
-                                        oauth_protocol, "_redirect_handler", None
-                                    ),
-                                    callback_handler=getattr(
-                                        oauth_protocol, "_callback_handler", None
-                                    ),
-                                    timeout=getattr(
-                                        oauth_protocol, "_timeout", self.timeout
-                                    ),
-                                    client_metadata_url=getattr(
-                                        oauth_protocol, "_client_metadata_url", None
-                                    ),
+                                    redirect_handler=getattr(oauth_protocol, "_redirect_handler", None),
+                                    callback_handler=getattr(oauth_protocol, "_callback_handler", None),
+                                    timeout=getattr(oauth_protocol, "_timeout", self.timeout),
+                                    client_metadata_url=getattr(oauth_protocol, "_client_metadata_url", None),
                                 )
-                                provider.context.protocol_version = request.headers.get(
-                                    MCP_PROTOCOL_VERSION
-                                )
+                                provider.context.protocol_version = request.headers.get(MCP_PROTOCOL_VERSION)
                                 gen = oauth_401_flow_generator(
                                     provider, original_request, original_401_response, initial_prm=prm
                                 )
@@ -431,9 +458,7 @@ class MultiProtocolAuthProvider(httpx.Auth):
                                     http_client=self._http_client,
                                     resource_metadata_url=resource_metadata_url,
                                     protected_resource_metadata=prm,
-                                    scope_from_www_auth=extract_scope_from_www_auth(
-                                        original_401_response
-                                    ),
+                                    scope_from_www_auth=extract_scope_from_www_auth(original_401_response),
                                 )
                                 credentials = await protocol.authenticate(context)
                                 to_store = _credentials_to_storage(credentials)
@@ -443,9 +468,7 @@ class MultiProtocolAuthProvider(httpx.Auth):
                             break
                         except Exception as e:
                             last_auth_error = e
-                            logger.debug(
-                                "Protocol %s authentication failed: %s", selected_id, e
-                            )
+                            logger.debug("Protocol %s authentication failed: %s", selected_id, e)
                             continue
 
                 credentials = await self._get_credentials()
