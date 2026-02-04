@@ -2,6 +2,7 @@
 """Multi-protocol MCP client: OAuth (with optional DPoP), API Key, Mutual TLS (placeholder)."""
 
 import asyncio
+import logging
 import os
 import threading
 import time
@@ -348,6 +349,10 @@ async def main() -> None:
     server_url = os.getenv("MCP_SERVER_URL", "http://localhost:8002/mcp")
     use_oauth = os.getenv("MCP_USE_OAUTH", "").lower() in ("1", "true", "yes")
     dpop_enabled = os.getenv("MCP_DPOP_ENABLED", "").lower() in ("1", "true", "yes")
+    forced_protocol = os.getenv("MCP_AUTH_PROTOCOL", os.getenv("MCP_PHASE2_PROTOCOL", "")).strip().lower()
+    # When protocol is oauth/oauth_dpop, enable OAuth (callback server + browser) so auth can complete
+    if forced_protocol in ("oauth", "oauth2", "oauth_dpop") and not use_oauth:
+        use_oauth = True
 
     print(f"Connecting to {server_url}...")
     print(f"  OAuth: {'enabled' if use_oauth else 'disabled'}")
@@ -365,6 +370,13 @@ async def main() -> None:
 
 
 def cli() -> None:
+    level_name = os.getenv("LOG_LEVEL", "WARNING").upper()
+    level = getattr(logging, level_name, logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     asyncio.run(main())
 
 

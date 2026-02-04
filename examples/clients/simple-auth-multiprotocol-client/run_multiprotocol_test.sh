@@ -79,6 +79,49 @@ curl -sS "http://localhost:${RS_PORT}/.well-known/oauth-protected-resource/mcp" 
 echo ""
 echo ""
 
+# Verify unified discovery endpoints
+echo "=== Protocol Discovery Endpoints ==="
+echo ""
+
+# Priority 1: PRM with mcp_auth_protocols
+echo "Priority 1: PRM endpoint (/.well-known/oauth-protected-resource/mcp):"
+if curl -sSf "http://localhost:${RS_PORT}/.well-known/oauth-protected-resource/mcp" > /dev/null 2>&1; then
+  echo "✅ PRM endpoint is accessible"
+  PRM_CONTENT=$(curl -sS "http://localhost:${RS_PORT}/.well-known/oauth-protected-resource/mcp")
+  if echo "$PRM_CONTENT" | grep -q "mcp_auth_protocols"; then
+    echo "✅ PRM contains mcp_auth_protocols field"
+  else
+    echo "⚠️  PRM does not contain mcp_auth_protocols field"
+  fi
+  echo "$PRM_CONTENT" | head -c 600
+  echo ""
+else
+  echo "❌ PRM endpoint not accessible"
+fi
+echo ""
+
+# Priority 2: Path-relative unified discovery (Way B)
+echo "Priority 2: Path-relative unified discovery (/.well-known/authorization_servers/mcp):"
+if curl -sSf "http://localhost:${RS_PORT}/.well-known/authorization_servers/mcp" > /dev/null 2>&1; then
+  echo "✅ Path-relative unified discovery endpoint is accessible"
+  curl -sS "http://localhost:${RS_PORT}/.well-known/authorization_servers/mcp" | head -c 600
+  echo ""
+else
+  echo "⚠️  Path-relative unified discovery endpoint not accessible"
+fi
+echo ""
+
+# Priority 3: Root-based unified discovery
+echo "Priority 3: Root-based unified discovery (/.well-known/authorization_servers):"
+if curl -sSf "http://localhost:${RS_PORT}/.well-known/authorization_servers" > /dev/null 2>&1; then
+  echo "✅ Root-based unified discovery endpoint is accessible"
+  curl -sS "http://localhost:${RS_PORT}/.well-known/authorization_servers" | head -c 600
+  echo ""
+else
+  echo "⚠️  Root-based unified discovery endpoint not accessible"
+fi
+echo ""
+
 # Run client by protocol
 if [ "$PROTOCOL" = "oauth" ] || [ "$PROTOCOL" = "oauth_dpop" ]; then
   if [ "$SKIP_OAUTH" = "1" ]; then

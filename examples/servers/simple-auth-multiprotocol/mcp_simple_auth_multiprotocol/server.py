@@ -168,11 +168,28 @@ def create_multiprotocol_resource_server(settings: ResourceServerSettings) -> St
             protocol_preferences=protocol_prefs if protocol_prefs else None,
         )
     )
+    # Add root-based unified discovery endpoint
     routes.extend(
         create_authorization_servers_discovery_routes(
             protocols=protocols_metadata,
             default_protocol=settings.default_protocol,
             protocol_preferences=protocol_prefs if protocol_prefs else None,
+        )
+    )
+    # Add path-relative unified discovery endpoint (Way B: /.well-known/authorization_servers/mcp)
+    # This allows clients to discover protocols at the path-relative location
+    from mcp.server.auth.handlers.discovery import AuthorizationServersDiscoveryHandler
+
+    path_relative_handler = AuthorizationServersDiscoveryHandler(
+        protocols=protocols_metadata,
+        default_protocol=settings.default_protocol,
+        protocol_preferences=protocol_prefs if protocol_prefs else None,
+    )
+    routes.append(
+        Route(
+            "/.well-known/authorization_servers/mcp",
+            endpoint=path_relative_handler.handle,
+            methods=["GET", "OPTIONS"],
         )
     )
 
