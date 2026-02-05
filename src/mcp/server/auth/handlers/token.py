@@ -40,16 +40,27 @@ class RefreshTokenRequest(BaseModel):
     resource: str | None = Field(None, description="Resource indicator for the token")
 
 
+class ClientCredentialsRequest(BaseModel):
+    # See https://datatracker.ietf.org/doc/html/rfc6749#section-4.4.2
+    grant_type: Literal["client_credentials"]
+    scope: str | None = Field(None, description="Optional scope parameter")
+    client_id: str
+    # we use the client_secret param, per https://datatracker.ietf.org/doc/html/rfc6749#section-2.3.1
+    client_secret: str | None = None
+    # RFC 8707 resource indicator
+    resource: str | None = Field(None, description="Resource indicator for the token")
+
+
 class TokenRequest(
     RootModel[
         Annotated[
-            AuthorizationCodeRequest | RefreshTokenRequest,
+            AuthorizationCodeRequest | RefreshTokenRequest | ClientCredentialsRequest,
             Field(discriminator="grant_type"),
         ]
     ]
 ):
     root: Annotated[
-        AuthorizationCodeRequest | RefreshTokenRequest,
+        AuthorizationCodeRequest | RefreshTokenRequest | ClientCredentialsRequest,
         Field(discriminator="grant_type"),
     ]
 
@@ -230,6 +241,28 @@ class TokenHandler:
                 try:
                     # Exchange refresh token for new tokens
                     tokens = await self.provider.exchange_refresh_token(client_info, refresh_token, scopes)
+                except TokenError as e:
+                    return self.response(
+                        TokenErrorResponse(
+                            error=e.error,
+                            error_description=e.error_description,
+                        )
+                    )
+
+            case ClientCredentialsRequest():
+                # Exchange client credentials for access token
+                scope_str = token_request.scope or getattr(client_info, "scope", None) or ""
+                scopes = scope_str.split(" ") if scope_str else []
+                exchange = getattr(self.provider, "exchange_client_credentials", None)
+                if exchange is None:
+                    return self.response(
+                        TokenErrorResponse(
+                            error="unsupported_grant_type",
+                            error_description="client_credentials is not supported by this authorization server",
+                        )
+                    )
+                try:
+                    tokens = await exchange(client_info, scopes=scopes, resource=token_request.resource)
                 except TokenError as e:
                     return self.response(
                         TokenErrorResponse(

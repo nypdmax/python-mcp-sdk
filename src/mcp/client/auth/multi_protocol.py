@@ -433,6 +433,7 @@ class MultiProtocolAuthProvider(httpx.Auth):
                                     callback_handler=getattr(oauth_protocol, "_callback_handler", None),
                                     timeout=getattr(oauth_protocol, "_timeout", self.timeout),
                                     client_metadata_url=getattr(oauth_protocol, "_client_metadata_url", None),
+                                    fixed_client_info=getattr(oauth_protocol, "_fixed_client_info", None),
                                 )
                                 provider.context.protocol_version = request.headers.get(MCP_PROTOCOL_VERSION)
                                 gen = oauth_401_flow_generator(
