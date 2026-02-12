@@ -9,7 +9,6 @@ are available as preset constants and consumed by the thin shim packages
 (``mcp_simple_auth_multiprotocol_prm_only``, etc.).
 """
 
-import contextlib
 import datetime
 import logging
 from dataclasses import dataclass
@@ -20,21 +19,14 @@ import uvicorn
 from pydantic import AnyHttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.applications import Starlette
-from starlette.middleware import Middleware
-from starlette.middleware.authentication import AuthenticationMiddleware
-from starlette.routing import Route
-from starlette.types import ASGIApp
 
-from mcp.server.auth.handlers.discovery import AuthorizationServersDiscoveryHandler
-from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
-from mcp.server.auth.middleware.bearer_auth import RequireAuthMiddleware
-from mcp.server.auth.routes import (
-    build_resource_metadata_url,
-    create_authorization_servers_discovery_routes,
-    create_protected_resource_routes,
+from mcp.server.auth.unified_app import (
+    ProtocolDiscoveryConfig,
+    ResourceServerConfig,
+    UnifiedAuthVariant,
+    create_unified_auth_app,
 )
-from mcp.server.auth.settings import AuthSettings
-from mcp.server.fastmcp.server import FastMCP, StreamableHTTPASGIApp
+from mcp.server.fastmcp.server import FastMCP
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.shared.auth import AuthProtocolMetadata
 
@@ -106,6 +98,15 @@ VARIANT_OAUTH_FALLBACK = VariantConfig(
     www_auth_include_protocol_hints=False,
 )
 
+# Mapping from VariantConfig.name to the SDK-level UnifiedAuthVariant enum.
+_VARIANT_MAP: dict[str, UnifiedAuthVariant] = {
+    "full": UnifiedAuthVariant.FULL,
+    "prm_only": UnifiedAuthVariant.PRM_ONLY,
+    "path_only": UnifiedAuthVariant.PATH_ONLY,
+    "root_only": UnifiedAuthVariant.ROOT_ONLY,
+    "oauth_fallback": UnifiedAuthVariant.OAUTH_FALLBACK,
+}
+
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -161,83 +162,6 @@ def _protocol_preferences_dict(prefs_str: str) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Variant helpers: PRM and discovery route injection
-# ---------------------------------------------------------------------------
-
-
-def _add_prm_routes(
-    routes: list[Route],
-    resource_url: AnyHttpUrl,
-    auth_settings: AuthSettings,
-    protocols_metadata: list[AuthProtocolMetadata],
-    settings: ResourceServerSettings,
-    variant: VariantConfig,
-) -> None:
-    """Add Protected Resource Metadata routes.
-
-    When the variant advertises protocols via PRM, ``mcp_auth_protocols``,
-    ``default_protocol``, and ``protocol_preferences`` are included.
-    Otherwise only RFC 9728 ``authorization_servers`` / ``scopes`` are served.
-    """
-    protocol_prefs = _protocol_preferences_dict(settings.protocol_preferences) or None
-    if variant.prm_includes_auth_protocols:
-        routes.extend(
-            create_protected_resource_routes(
-                resource_url=resource_url,
-                authorization_servers=[auth_settings.issuer_url],
-                scopes_supported=auth_settings.required_scopes,
-                auth_protocols=protocols_metadata,
-                default_protocol=settings.default_protocol,
-                protocol_preferences=protocol_prefs,
-            )
-        )
-    else:
-        # Explicit empty list so the PRM JSON includes "mcp_auth_protocols": []
-        # rather than omitting the field — signals "no protocols via PRM".
-        routes.extend(
-            create_protected_resource_routes(
-                resource_url=resource_url,
-                authorization_servers=[auth_settings.issuer_url],
-                scopes_supported=auth_settings.required_scopes,
-                auth_protocols=[],
-                default_protocol=None,
-                protocol_preferences=None,
-            )
-        )
-
-
-def _add_discovery_routes(
-    routes: list[Route],
-    protocols_metadata: list[AuthProtocolMetadata],
-    settings: ResourceServerSettings,
-    variant: VariantConfig,
-) -> None:
-    """Add unified discovery routes (root, path-relative, or none) based on variant."""
-    protocol_prefs = _protocol_preferences_dict(settings.protocol_preferences) or None
-    if variant.expose_root_discovery:
-        routes.extend(
-            create_authorization_servers_discovery_routes(
-                protocols=protocols_metadata,
-                default_protocol=settings.default_protocol,
-                protocol_preferences=protocol_prefs,
-            )
-        )
-    if variant.expose_path_discovery:
-        handler = AuthorizationServersDiscoveryHandler(
-            protocols=protocols_metadata,
-            default_protocol=settings.default_protocol,
-            protocol_preferences=protocol_prefs,
-        )
-        routes.append(
-            Route(
-                "/.well-known/authorization_servers/mcp",
-                endpoint=handler.handle,
-                methods=["GET", "OPTIONS"],
-            )
-        )
-
-
-# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -246,7 +170,10 @@ def create_multiprotocol_resource_server(
     settings: ResourceServerSettings,
     variant: VariantConfig = VARIANT_FULL,
 ) -> Starlette:
-    """Create Starlette app with MultiProtocolAuthBackend, PRM, and discovery routes."""
+    """Create Starlette app with MultiProtocolAuthBackend, PRM, and discovery routes.
+
+    Delegates to ``create_unified_auth_app`` for route/middleware assembly.
+    """
     oauth_verifier = IntrospectionTokenVerifier(
         introspection_endpoint=settings.auth_server_introspection_endpoint,
         server_url=str(settings.server_url),
@@ -291,53 +218,26 @@ def create_multiprotocol_resource_server(
         stateless=False,
         security_settings=None,
     )
-    streamable_app: ASGIApp = StreamableHTTPASGIApp(session_manager)
 
-    auth_settings = AuthSettings(
-        issuer_url=settings.auth_server_url,
-        required_scopes=[settings.mcp_scope],
-        resource_server_url=settings.server_url,
-    )
-    resource_url = auth_settings.resource_server_url
-    assert resource_url is not None
-    resource_metadata_url = build_resource_metadata_url(resource_url)
     protocols_metadata = _protocol_metadata_list(settings)
-    auth_protocol_ids = [p.protocol_id for p in protocols_metadata]
     protocol_prefs = _protocol_preferences_dict(settings.protocol_preferences) or None
-    www_auth_protocol_ids = auth_protocol_ids if variant.www_auth_include_protocol_hints else None
-    www_auth_default_protocol = settings.default_protocol if variant.www_auth_include_protocol_hints else None
-    www_auth_protocol_prefs = protocol_prefs if variant.www_auth_include_protocol_hints else None
+    unified_variant = _VARIANT_MAP[variant.name]
 
-    require_auth = RequireAuthMiddleware(
-        streamable_app,
-        required_scopes=[settings.mcp_scope],
-        resource_metadata_url=resource_metadata_url,
-        auth_protocols=www_auth_protocol_ids,
-        default_protocol=www_auth_default_protocol,
-        protocol_preferences=www_auth_protocol_prefs,
-    )
-
-    routes: list[Route] = [
-        Route("/mcp", endpoint=require_auth),
-    ]
-    _add_prm_routes(routes, resource_url, auth_settings, protocols_metadata, settings, variant)
-    _add_discovery_routes(routes, protocols_metadata, settings, variant)
-
-    middleware = [
-        Middleware(AuthenticationMiddleware, backend=adapter),
-        Middleware(AuthContextMiddleware),
-    ]
-
-    @contextlib.asynccontextmanager
-    async def lifespan(app: Starlette):
-        async with session_manager.run():
-            yield
-
-    return Starlette(
+    return create_unified_auth_app(
+        session_manager=session_manager,
+        auth_backend=adapter,
+        resource_config=ResourceServerConfig(
+            resource_url=settings.server_url,
+            authorization_servers=[settings.auth_server_url],
+            required_scopes=[settings.mcp_scope],
+        ),
+        discovery_config=ProtocolDiscoveryConfig(
+            protocols=protocols_metadata,
+            default_protocol=settings.default_protocol,
+            protocol_preferences=protocol_prefs,
+        ),
+        variant=unified_variant,
         debug=True,
-        routes=routes,
-        middleware=middleware,
-        lifespan=lifespan,
     )
 
 
