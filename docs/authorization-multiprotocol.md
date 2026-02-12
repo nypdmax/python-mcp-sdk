@@ -300,6 +300,83 @@ No changes to the AS are required for multi-protocol itself; the AS need only su
 4. **Build backend** — Instantiate `OAuthTokenVerifier`, `APIKeyVerifier`, and (if needed) other verifiers; pass them into `MultiProtocolAuthBackend`. If DPoP is used, create a `DPoPProofVerifier` and pass it into `backend.verify(request, dpop_verifier=...)`.
 5. **401/403 responses** — Use middleware that returns 401 with WWW-Authenticate (Bearer at minimum; add `resource_metadata`, `auth_protocols`, `default_protocol`, `protocol_preferences` for MCP clients). Optionally return 403 with `error` and `scope` when appropriate.
 
+#### 3.3.1 FastMCP + unified auth app factory (recommended assembly)
+
+If you are using `FastMCP` (shim around `MCPServer`) but want to run **multi-protocol auth** (OAuth + API Key + optional DPoP) and expose PRM + unified discovery, use the unified factory:
+
+- `create_unified_auth_app(...)` builds a mountable Starlette app that includes:
+  - protected MCP entry path (`/mcp` by default),
+  - RFC 9728 PRM endpoint derived from `resource_url`,
+  - optional `/.well-known/authorization_servers` discovery,
+  - `AuthenticationMiddleware` + `AuthContextMiddleware`,
+  - `session_manager.run()` bound to lifespan.
+
+```python
+import uvicorn
+from pydantic import AnyHttpUrl
+
+from mcp.server.auth.unified_app import (
+    ProtocolDiscoveryConfig,
+    ResourceServerConfig,
+    UnifiedAuthVariant,
+    create_unified_auth_app,
+)
+from mcp.server.fastmcp.server import FastMCP
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.shared.auth import AuthProtocolMetadata
+
+# Build your multi-protocol Starlette AuthenticationBackend adapter (example code omitted)
+# auth_backend = MultiProtocolAuthBackendAdapter(...)
+
+fastmcp = FastMCP(
+    name="My MCP server (multi-protocol)",
+    host="localhost",
+    port=8002,
+    auth=None,  # auth handled by the unified app middleware
+)
+
+@fastmcp.tool()
+async def get_time() -> dict[str, object]:
+    return {"ok": True}
+
+session_manager = StreamableHTTPSessionManager(app=getattr(fastmcp, "_mcp_server"))
+
+protocols = [
+    AuthProtocolMetadata(
+        protocol_id="oauth2",
+        protocol_version="2.0",
+        metadata_url=AnyHttpUrl("http://localhost:9000/.well-known/oauth-authorization-server"),
+        scopes_supported=["user"],
+    ),
+    AuthProtocolMetadata(protocol_id="api_key", protocol_version="1.0"),
+    AuthProtocolMetadata(protocol_id="mutual_tls", protocol_version="1.0"),
+]
+
+app = create_unified_auth_app(
+    session_manager=session_manager,
+    auth_backend=auth_backend,
+    resource_config=ResourceServerConfig(
+        # Canonical resource identifier (RFC 8707) used for PRM path derivation (RFC 9728).
+        # If you include a path (e.g. /mcp or /server/mcp), PRM is served at
+        #   /.well-known/oauth-protected-resource{path}.
+        # If you omit the path (origin-only), PRM is served at
+        #   /.well-known/oauth-protected-resource.
+        resource_url=AnyHttpUrl("http://localhost:8002/mcp"),
+        authorization_servers=[AnyHttpUrl("http://localhost:9000")],
+        required_scopes=["user"],
+        # mcp_entry_path defaults to "/mcp"; set it if your MCP endpoint path differs.
+    ),
+    discovery_config=ProtocolDiscoveryConfig(
+        protocols=protocols,
+        default_protocol="oauth2",
+        protocol_preferences={"oauth2": 1, "api_key": 2, "mutual_tls": 3},
+    ),
+    variant=UnifiedAuthVariant.FULL,
+)
+
+uvicorn.run(app, host="localhost", port=8002)
+```
+
 ### 3.4 API reference (AuthProtocol, CredentialVerifier)
 
 #### AuthProtocol (`mcp.client.auth.protocol`)
